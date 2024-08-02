@@ -1,0 +1,208 @@
+# Manufacturing Process Optimization (Defects from PVT)
+
+# This script has been tested using real-time manufacturing sensor data of pressure, vibrations and temperatures to optimize defects. 
+# Load using the necessary files and metrics to use.
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import pandas as pd
+import seaborn as sns
+import numpy as np
+from scipy import stats
+from scipy.stats import pearsonr
+from datetime import datetime, timedelta
+
+# Load data from CSV files
+production_data = pd.read_csv("path_to/production_data.csv")
+sensor_data = pd.read_csv("path_to/sensor_data.csv")
+shipping_data = pd.read_csv("path_to/shipping_data.csv")
+quality_control_data = pd.read_csv("path_to/quality_control_data.csv")
+maintenance_data = pd.read_csv("path_to/maintenance_data.csv")
+raw_material_data = pd.read_csv("path_to/raw_material_data.csv")
+
+# Merge data sets
+production_sensor_data = production_data.merge(sensor_data, on="production_run_id", how="left")
+production_sensor_shipping_data = production_sensor_data.merge(shipping_data, on="production_run_id", how="left")
+all_data = production_sensor_shipping_data.merge(quality_control_data, on="production_run_id", how="left")
+all_data = all_data.merge(maintenance_data, on=["production_run_id", "machine_id"], how="left")
+all_data = all_data.merge(raw_material_data, on=["material_id"], how="left")
+
+# Remove rows with missing values
+all_data = all_data.dropna()
+
+# Parse time strings
+all_data["activity_start_time"] = [datetime.strptime(time_str, "%H:%M:%S") for time_str in all_data["activity_start_time"]]
+all_data["activity_end_time"] = [datetime.strptime(time_str, "%H:%M:%S") for time_str in all_data["activity_end_time"]]
+
+# Calculate durations
+all_data["activity_duration_minutes"] = (all_data["activity_end_time"] - all_data["activity_start_time"]).apply(lambda x: x / timedelta(minutes=1))
+all_data["downtime_minutes"] = all_data.groupby("production_run_id")["activity_duration_minutes"].sum()
+total_downtime = all_data["downtime_minutes"].sum()
+
+# Calculate performance metrics
+all_data["defect_rate"] = all_data["num_units_defective"] / all_data["num_units_produced"]
+total_production_time = all_data["production_time_minutes"].sum()
+total_operational_time = total_production_time - total_downtime
+all_data["uptime_perc"] = total_operational_time / total_production_time
+all_data["uptime_ratio"] = all_data["machine_temp"].count() / all_data["num_units_produced"]
+
+# Plot correlations
+sns.pairplot(all_data, vars=["machine_temp", "machine_pressure", "machine_vibration"], hue="defect_rate")
+sns.pairplot(all_data, vars=["machine_temp", "machine_pressure", "machine_vibration"], hue="uptime_perc")
+sns.pairplot(all_data, vars=["machine_temp", "machine_pressure", "machine_vibration"], hue="uptime_ratio")
+
+# Test for correlations
+defect_rate_temp_corr, defect_rate_temp_pval = stats.pearsonr(all_data["machine_temp"], all_data["defect_rate"])
+uptime_temp_corr, uptime_temp_pval = stats.pearsonr(all_data["machine_temp"], all_data["uptime_ratio"])
+defect_rate_pressure_corr, defect_rate_pressure_pval = stats.pearsonr(all_data["machine_pressure"], all_data["defect_rate"])
+uptime_pressure_corr, uptime_pressure_pval = stats.pearsonr(all_data["machine_pressure"], all_data["uptime_ratio"])
+defect_rate_vibration_corr, defect_rate_vibration_pval = stats.pearsonr(all_data["machine_vibration"], all_data["defect_rate"])
+uptime_vibration_corr, uptime_vibration_pval = stats.pearsonr(all_data["machine_vibration"], all_data["uptime_ratio"])
+
+# Add correlation and p-value results as columns in all_data
+all_data["defect_rate_temp_corr"] = defect_rate_temp_corr
+all_data["defect_rate_temp_pval"] = defect_rate_temp_pval
+all_data["uptime_temp_corr"] = uptime_temp_corr
+all_data["uptime_temp_pval"] = uptime_temp_pval
+all_data["defect_rate_pressure_corr"] = defect_rate_pressure_corr
+all_data["defect_rate_pressure_pval"] = defect_rate_pressure_pval
+
+# Optimizer Block for maximum uptime
+optimal_params = {}
+for machine_id in all_data["machine_id"].unique():
+    machine_data = all_data[all_data["machine_id"] == machine_id]
+    optimal_params[machine_id] = {}
+    for material_id in machine_data["material_id"].unique():
+        material_data = machine_data[machine_data["material_id"] == material_id]
+        optimal_temp = material_data[material_data["uptime_perc"] == material_data["uptime_perc"].max()]["machine_temp"].mean()
+        optimal_pressure = material_data[material_data["uptime_perc"] == material_data["uptime_perc"].max()]["machine_pressure"].mean()
+        optimal_vibration = material_data[material_data["uptime_perc"] == material_data["uptime_perc"].max()]["machine_vibration"].mean()
+        optimal_params[machine_id][material_id] = {
+            "temp": optimal_temp,
+            "pressure": optimal_pressure,
+            "vibration": optimal_vibration,
+        }
+
+# Convert optimal_params dictionary to a DataFrame
+optimal_params_df = pd.DataFrame.from_dict(optimal_params, orient="index")
+optimal_params_df.index.name = "machine_id"
+optimal_params_pivoted = optimal_params_df.unstack(level=0)
+optimal_params_pivoted = optimal_params_pivoted.reset_index()
+optimal_params_pivoted = optimal_params_pivoted.set_index("machine_id")
+optimal_params_pivoted = optimal_params_pivoted.reset_index()
+optimal_params_pivoted = optimal_params_pivoted.rename(columns={'level_0': 'material_id'})
+
+def split_optimal_params(row):
+    if pd.isna(row[0]):
+        return pd.Series({'temp': np.nan, 'pressure': np.nan, 'vibration': np.nan})
+    else:
+        temp = row[0]['temp']
+        pressure = row[0]['pressure']
+        vibration = row[0]['vibration']
+        return pd.Series({'temp': temp, 'pressure': pressure, 'vibration': vibration})
+
+optimal_params_pivoted[["temp", "pressure", "vibration"]] = optimal_params_pivoted.apply(split_optimal_params, axis=1)
+optimal_params = optimal_params_pivoted.drop(columns=[0])
+
+# Write the production plan to a spreadsheet
+optimal_params.to_csv("path_to/optimal_uptime_production_plan.csv", index=False)
+all_data.to_csv("path_to/all_data_prod_sens_ship_quali.csv", index=False)
+
+# Optimizer Block for minimum defect rates
+optimal_params = {}
+for machine_id in all_data["machine_id"].unique():
+    machine_data = all_data[all_data["machine_id"] == machine_id]
+    optimal_params[machine_id] = {}
+    for material_id in machine_data["material_id"].unique():
+        material_data = machine_data[machine_data["material_id"] == material_id]
+        optimal_temp = material_data[material_data["defect_rate"] == material_data["defect_rate"].min()]["machine_temp"].mean()
+        optimal_pressure = material_data[material_data["defect_rate"] == material_data["defect_rate"].min()]["machine_pressure"].mean()
+        optimal_vibration = material_data[material_data["defect_rate"] == material_data["defect_rate"].min()]["machine_vibration"].mean()
+        optimal_params[machine_id][material_id] = {
+            "temp": optimal_temp,
+            "pressure": optimal_pressure,
+            "vibration": optimal_vibration,
+        }
+
+# Convert optimal_params dictionary to a DataFrame
+optimal_params_df = pd.DataFrame.from_dict(optimal_params, orient="index")
+optimal_params_df.index.name = "machine_id"
+optimal_params_pivoted = optimal_params_df.unstack(level=0)
+optimal_params_pivoted = optimal_params_pivoted.reset_index()
+optimal_params_pivoted = optimal_params_pivoted.set_index("machine_id")
+optimal_params_pivoted = optimal_params_pivoted.reset_index()
+optimal_params_pivoted = optimal_params_pivoted.rename(columns={'level_0': 'material_id'})
+
+def split_optimal_params(row):
+    if pd.isna(row[0]):
+        return pd.Series({'temp': np.nan, 'pressure': np.nan, 'vibration': np.nan})
+    else:
+        temp = row[0]['temp']
+        pressure = row[0]['pressure']
+        vibration = row[0]['vibration']
+        return pd.Series({'temp': temp, 'pressure': pressure, 'vibration': vibration})
+
+optimal_params_pivoted[["temp", "pressure", "vibration"]] = optimal_params_pivoted.apply(split_optimal_params, axis=1)
+optimal_params = optimal_params_pivoted.drop(columns=[0])
+
+average_defects = all_data.groupby(["machine_id", "material_id"]).mean()["defect_rate"].rename("defect_rate_before").reset_index()
+target_defects = all_data.groupby(["machine_id", "material_id"]).min()["defect_rate"].rename("optimal_defect_rate").reset_index()
+all_data = all_data.merge(average_defects, on=["machine_id", "material_id"])
+all_data = all_data.merge(target_defects, on=["machine_id", "material_id"])
+optimal_params = optimal_params.merge(average_defects, on=["machine_id", "material_id"])
+optimal_params = optimal_params.merge(target_defects, on=["machine_id", "material_id"])
+optimal_params['Target Performance Improvement %'] = ((optimal_params['defect_rate_before'] - optimal_params['optimal_defect_rate']) / optimal_params['defect_rate_before']) * 100
+
+# Write the production plan to a spreadsheet
+optimal_params.to_csv("path_to/optimal_production_plan.csv", index=False)
+all_data.to_csv("path_to/all_data_incl_maint_mat.csv", index=False)
+
+# Analyze production run efficiency
+all_data["machine_capacity"] = all_data["num_units_produced"] / all_data["production_time_minutes"]
+all_data["yield"] = all_data["num_units_produced"] / all_data["raw_material_units_used"]
+all_data["output_rate"] = all_data["num_units_produced"] / all_data["production_time_minutes"]
+all_data["efficiency"] = all_data["output_rate"] / all_data["machine_capacity"]
+
+# Plot correlations between performance metrics and other variables
+all_data.plot(x="machine_temp", y="yield", kind="scatter")
+all_data.plot(x="machine_pressure", y="yield", kind="scatter")
+all_data.plot(x="machine_vibration", y="yield", kind="scatter")
+all_data.plot(x="maintenance_type", y="yield", kind="bar")
+all_data.plot(x="material_name", y="yield", kind="bar")
+
+# Calculate correlation between machine temperature and yield
+x = all_data["machine_temp"]
+y = all_data["yield"]
+corr, pval = pearsonr(x, y)
+
+# Analyze the impact of machine downtime
+all_data["activity_start_time"] = [datetime.strptime(time_str, "%I:%M:%S %p") for time_str in all_data["activity_start_time"]]
+all_data["activity_end_time"] = [datetime.strptime(time_str, "%I:%M:%S %p") for time_str in all_data["activity_end_time"]]
+all_data["activity_duration_minutes"] = (all_data["activity_end_time"] - all_data["activity_start_time"]).apply(lambda x: x / timedelta(minutes=1))
+all_data["downtime_minutes"] = all_data.groupby("production_run_id")["activity_duration_minutes"].sum()
+all_data["downtime_percent"] = all_data["downtime_minutes"] / all_data["production_time_minutes"]
+
+# Plot correlations between machine downtime and performance metrics
+all_data.plot(x="downtime_percent", y="yield", kind="scatter")
+all_data.plot(x="downtime_percent", y="output_rate", kind="scatter")
+all_data.plot(x="downtime_percent", y="efficiency", kind="scatter")
+
+# Calculate correlation between machine downtime and yield
+x = all_data["downtime_percent"]
+y = all_data["yield"]
+corr, pval = pearsonr(x, y)
+
+# Analyze the impact of raw material quality
+all_data.plot(x="Strength", y="defect_rate", kind="scatter")
+all_data.plot(x="Conductivity", y="defect_rate", kind="scatter")
+
+# Analyze the impact of production schedule on performance
+all_data.plot(x="production_time_minutes", y="defect_rate", kind="scatter")
+all_data.plot(x="production_time_minutes", y="uptime", kind="scatter")
+all_data.plot(x="production_time_minutes", y="efficiency", kind="scatter")
+
+# Calculate Pearson's correlation coefficient and p-value for each correlation
+defect_rate_schedule_corr, defect_rate_schedule_pval = stats.pearsonr(all_data["production_time_minutes"], all_data["defect_rate"])
+uptime_schedule_corr, uptime_schedule_pval = stats.pearsonr(all_data["production_time_minutes"], all_data["uptime"])
+efficiency_schedule_corr, efficiency_schedule_pval = stats.pearsonr(all_data["production_time_minutes"], all_data["efficiency"])
